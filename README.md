@@ -75,8 +75,7 @@ Para que el script funcione correctamente, la tabla en Notion debe contener las 
 
 | Propiedad | Tipo | Notas |
 |---|---|---|
-| Activo | Select | Nombre de la inversión (ej. `Bitcoin`, `Frasco NaranjaX`) |
-| Fecha | Date | Fecha en la que se realizó la inversión |
-| Inversion Inicial (ARS/USDT) | Number | Capital inicial invertido |
-| Cantidad Obtenida | Number | Solo para criptomonedas (ej. cantidad de BTC) |
-| TNA (%) | Number | Solo para cuentas remuneradas (ej. `45.5`) |
+| Activo | Title | Nombre de la inversión (ej. `SP - 500`, `Bitcoin`, `FF`) |
+| Aportado ARS | Number o Formula | Capital total invertido en pesos |
+| Cantidad Obtenida | Number o Rollup | Cantidad total del activo comprado (para CEDEARs, ETFs, USD, BTC) |
+| Saldo actual | Number o Formula | Valor actual en pesos para los Fondos (ej. FF), o 0 si cotizan en bolsa |

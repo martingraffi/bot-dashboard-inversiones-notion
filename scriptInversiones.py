@@ -8,6 +8,7 @@ import schedule
 import time
 import threading
 import pytz
+import yfinance as yf
 
 # --- CONFIGURACIÓN ---
 NOTION_TOKEN = '' 
@@ -45,36 +46,102 @@ def leer_inversiones_notion():
     inversiones = []
     for item in resultados:
         props = item['properties']
-        activo = props['Activo']['select']['name'] if props.get('Activo', {}).get('select') else 'Desconocido'
-        if props.get('Fecha', {}).get('date'):
-            fecha_str = props['Fecha']['date']['start']
-            fecha_inv = datetime.strptime(fecha_str, "%Y-%m-%d")
-            inv_inicial = props.get('Inversion Inicial (ARS/USDT)', {}).get('number') or 0
-            datos_inv = {'activo': activo, 'fecha': fecha_inv, 'inicial': inv_inicial}
-            if activo == 'Bitcoin':
-                datos_inv['cantidad'] = props.get('Cantidad Obtenida', {}).get('number') or 0
-            elif 'Frasco NaranjaX' in activo:
-                datos_inv['tna'] = props.get('TNA (%)', {}).get('number') or 0
+
+        # Leer nombre del activo desde el título de la página
+        activo = 'Desconocido'
+        if 'Activo' in props and props['Activo']['title']:
+            activo = props['Activo']['title'][0]['text']['content']
+
+        inv_inicial = props.get('Aportado ARS', {}).get('formula', {}).get('number') or props.get('Aportado ARS', {}).get('number') or 0
+
+        # Obtener la cantidad de la propiedad rollup o number
+        cantidad = 0
+        if 'Cantidad Obtenida' in props:
+            if props['Cantidad Obtenida']['type'] == 'rollup':
+                cantidad = props['Cantidad Obtenida']['rollup']['number'] or 0
+            elif props['Cantidad Obtenida']['type'] == 'number':
+                cantidad = props['Cantidad Obtenida']['number'] or 0
+
+        # Leer saldo actual (formula o rollup)
+        saldo_actual = 0
+        if 'Saldo actual' in props:
+            if props['Saldo actual']['type'] == 'formula':
+                saldo_actual = props['Saldo actual']['formula']['number'] or 0
+            elif props['Saldo actual']['type'] == 'number':
+                saldo_actual = props['Saldo actual']['number'] or 0
+
+        datos_inv = {
+            'activo': activo,
+            'inicial': float(inv_inicial),
+            'cantidad': float(cantidad),
+            'saldo_actual': float(saldo_actual)
+        }
+
+        # Solo agregar inversiones que tengan algún valor o cantidad
+        if datos_inv['inicial'] > 0 or datos_inv['cantidad'] > 0 or datos_inv['saldo_actual'] > 0:
             inversiones.append(datos_inv)
+
     return inversiones
+
+# Mapeo de activos a tickers de Yahoo Finance
+TICKERS_YF = {
+    'SP - 500': 'SPY',
+    'GOOGL': 'GOOGL.BA',
+    'BRKB': 'BRKB.BA',
+    'GLD': 'GLD.BA',
+    'EEM': 'EEM.BA'
+}
 
 def procesar_datos(inversiones):
     if not inversiones: return []
     precio_btc = obtener_precio_btc(); dolar_cripto = obtener_dolar_cripto()
-    hoy = obtener_hora_local().replace(tzinfo=None)
+
+    # Pre-obtener precios de Yahoo Finance
+    precios_yf = {}
+    tickers_a_buscar = [ticker for activo, ticker in TICKERS_YF.items() if any(i['activo'] == activo for i in inversiones)]
+    if tickers_a_buscar:
+        try:
+            datos_yf = yf.download(tickers_a_buscar, period="1d", group_by='ticker')
+            if len(tickers_a_buscar) == 1:
+                # Caso de un solo ticker
+                ticker = tickers_a_buscar[0]
+                if not datos_yf.empty:
+                    precios_yf[ticker] = float(datos_yf['Close'].iloc[-1])
+            else:
+                for ticker in tickers_a_buscar:
+                    if ticker in datos_yf and not datos_yf[ticker].empty:
+                        precios_yf[ticker] = float(datos_yf[ticker]['Close'].iloc[-1])
+        except Exception as e:
+            print(f"Error al obtener datos de Yahoo Finance: {e}")
+
     datos_agrupados = {}
     for inv in inversiones:
         valor_actual_ars = 0
-        if inv['activo'] == 'Bitcoin':
-            valor_actual_ars = (inv['cantidad'] * precio_btc) * dolar_cripto
-        elif 'Frasco NaranjaX' in inv['activo']:
-            dias_pasados = max(0, (hoy - inv['fecha']).days)
-            interes = inv['inicial'] * (inv['tna'] / 100) * (dias_pasados / 365)
-            valor_actual_ars = inv['inicial'] + interes
-        ganancia = valor_actual_ars - inv['inicial']
         activo = inv['activo']
+
+        # Calcular valor actual según tipo de activo
+        if activo == 'Bitcoin':
+            valor_actual_ars = (inv['cantidad'] * precio_btc) * dolar_cripto
+        elif activo == 'USD':
+            valor_actual_ars = inv['cantidad'] * dolar_cripto
+        elif activo in TICKERS_YF:
+            ticker = TICKERS_YF[activo]
+            precio_activo = precios_yf.get(ticker, 0)
+
+            if ticker.endswith('.BA'):
+                # Es un CEDEAR en pesos
+                valor_actual_ars = inv['cantidad'] * precio_activo
+            else:
+                # Es un ETF en dólares
+                valor_actual_ars = inv['cantidad'] * precio_activo * dolar_cripto
+        else:
+            # Para fondos comunes u otros (ej. FF), usar el saldo actual de Notion
+            valor_actual_ars = inv['saldo_actual']
+
+        ganancia = valor_actual_ars - inv['inicial']
+
         if activo not in datos_agrupados:
-            datos_agrupados[activo] = {'nombre_corto': activo, 'inicial': 0, 'actual': 0, 'ganancia': 0, 'fecha_min': inv['fecha']}
+            datos_agrupados[activo] = {'nombre_corto': activo, 'inicial': 0, 'actual': 0, 'ganancia': 0}
         datos_agrupados[activo]['inicial'] += inv['inicial']
         datos_agrupados[activo]['actual'] += valor_actual_ars
         datos_agrupados[activo]['ganancia'] += ganancia
@@ -83,9 +150,7 @@ def procesar_datos(inversiones):
     for activo, data in datos_agrupados.items():
         pct = (data['ganancia'] / data['inicial'] * 100) if data['inicial'] > 0 else 0
         datos_procesados.append({
-            'nombre': f"{activo}\n({data['fecha_min'].strftime('%m/%Y')})",
             'nombre_corto': activo,
-            'fecha_min': data['fecha_min'],
             'inicial': data['inicial'],
             'actual': data['actual'],
             'ganancia': data['ganancia'],
@@ -102,10 +167,10 @@ def generar_dashboard(datos, precio_btc, dolar_cripto):
     for d in datos:
         if d['nombre_corto'] == 'Bitcoin':
             nombres.append(
-                f"Bitcoin\nBTC: US${precio_btc:,.0f} | ARS {dolar_cripto:,.0f}\n({d['fecha_min'].strftime('%m/%Y')})"
+                f"Bitcoin\nBTC: US${precio_btc:,.0f} | ARS {dolar_cripto:,.0f}"
             )
         else:
-            nombres.append(f"{d['nombre_corto']}\n({d['fecha_min'].strftime('%m/%Y')})")
+            nombres.append(f"{d['nombre_corto']}")
     iniciales = [d['inicial'] for d in datos]; actuales = [d['actual'] for d in datos]
     total_inv = sum(iniciales); total_act = sum(actuales)
     
